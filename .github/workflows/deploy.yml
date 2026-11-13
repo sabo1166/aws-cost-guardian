@@ -1,5 +1,11 @@
 name: Cost Guardian
 
+# Four jobs, so a failure points at one stage:
+#   1-preflight  credentials + which AWS services this account allows
+#   2-plan       terraform init / validate / plan (saves the plan)
+#   3-deploy     applies the saved plan, or destroys
+#   4-test       end-to-end test with two t3.micro instances
+
 on:
   workflow_dispatch:
     inputs:
@@ -13,6 +19,11 @@ on:
         description: "Email for budget alerts"
         required: true
         type: string
+      enable_budget:
+        description: "Create the AWS Budget (turn off in sandbox accounts where an SCP blocks AWS Budgets)"
+        required: true
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -26,15 +37,28 @@ env:
   TF_IN_AUTOMATION: "true"
   TF_VAR_alert_email: ${{ inputs.alert_email }}
   TF_VAR_aws_region: ${{ secrets.AWS_REGION }}
+  TF_VAR_enable_budget: ${{ inputs.enable_budget }}
+  STATE_KEY: aws-cost-guardian/terraform.tfstate
 
 jobs:
-  guardian:
+  # ---------------------------------------------------------------------------
+  preflight:
+    name: 1-preflight (credentials and service access)
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: terraform
+    outputs:
+      bucket: ${{ steps.state.outputs.bucket }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Credential sanity check (prints no secret values)
+        env:
+          KID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          SEC: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          REG: ${{ secrets.AWS_REGION }}
+        run: |
+          echo "Access key ID length: ${#KID} (expected 20)"
+          echo "Access key ID type: $(printf '%s' "$KID" | cut -c1-4) (AKIA = long-term IAM user key, ASIA = temporary key)"
+          echo "Secret access key length: ${#SEC} (expected 40)"
+          case "$KID$SEC$REG" in *[[:space:]]*) echo "::warning::A space or line break was found inside one of the AWS secrets";; esac
+          if printf '%s' "$REG" | grep -Eq '^[a-z]{2}(-[a-z]+)+-[0-9]$'; then echo "Region format: OK"; else echo "::warning::AWS_REGION does not look like a region code (e.g. us-east-1)"; fi
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -45,6 +69,34 @@ jobs:
       - name: Who am I
         run: aws sts get-caller-identity --query "{Account:Account,Arn:Arn}" --output table
 
+      - name: Service access probe (read-only calls)
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          probe() {
+            local name="$1"; shift
+            if out=$("$@" 2>&1 >/dev/null); then
+              echo "| $name | ✅ allowed |" >> "$GITHUB_STEP_SUMMARY"; echo "OK   $name"
+            else
+              reason=$(printf '%s' "$out" | grep -oE '(AccessDenied[A-Za-z]*|UnauthorizedOperation|explicit deny in a service control policy|[A-Za-z]+Exception)' | head -2 | tr '\n' ' ')
+              echo "| $name | ❌ ${reason:-error} |" >> "$GITHUB_STEP_SUMMARY"; echo "FAIL $name: $reason"
+            fi
+          }
+          {
+            echo "## 1-preflight: what this AWS account allows"
+            echo ""
+            echo "| Service (read-only check) | Result |"
+            echo "| --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          probe "S3 (state bucket)"        aws s3api list-buckets --max-items 1
+          probe "SNS"                      aws sns list-topics
+          probe "Lambda"                   aws lambda list-functions --max-items 1
+          probe "IAM (roles)"              aws iam list-roles --max-items 1
+          probe "CloudWatch Logs"          aws logs describe-log-groups --limit 1
+          probe "EC2"                      aws ec2 describe-instances --max-results 5
+          probe "AWS Budgets"              aws budgets describe-budgets --account-id "$ACCOUNT_ID" --max-results 1
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Read checks only. A service can allow reads but still deny writes (an SCP did that for Budgets: ModifyBudget was denied)." >> "$GITHUB_STEP_SUMMARY"
+
       - name: State bucket (create once if missing)
         id: state
         run: |
@@ -52,9 +104,9 @@ jobs:
           BUCKET="cost-guardian-tfstate-${ACCOUNT_ID}-${AWS_REGION}"
           echo "bucket=${BUCKET}" >> "$GITHUB_OUTPUT"
           if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
-            echo "State bucket exists: $BUCKET"
+            echo "State bucket exists"
           else
-            echo "Creating state bucket: $BUCKET"
+            echo "Creating state bucket"
             if [ "$AWS_REGION" = "us-east-1" ]; then
               aws s3api create-bucket --bucket "$BUCKET"
             else
@@ -69,6 +121,24 @@ jobs:
               --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
           fi
 
+  # ---------------------------------------------------------------------------
+  plan:
+    name: 2-plan (terraform init, validate, plan)
+    needs: preflight
+    if: inputs.action == 'plan' || inputs.action == 'apply' || inputs.action == 'destroy'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: latest
@@ -77,8 +147,8 @@ jobs:
       - name: Terraform init
         run: |
           terraform init -input=false \
-            -backend-config="bucket=${{ steps.state.outputs.bucket }}" \
-            -backend-config="key=aws-cost-guardian/terraform.tfstate" \
+            -backend-config="bucket=${{ needs.preflight.outputs.bucket }}" \
+            -backend-config="key=${STATE_KEY}" \
             -backend-config="region=${AWS_REGION}"
 
       - name: Terraform fmt and validate
@@ -87,17 +157,96 @@ jobs:
           terraform validate
 
       - name: Terraform plan
-        if: inputs.action == 'plan' || inputs.action == 'apply'
-        run: terraform plan -input=false -out=tfplan
+        run: |
+          if [ "${{ inputs.action }}" = "destroy" ]; then
+            terraform plan -destroy -input=false -out=tfplan
+          else
+            terraform plan -input=false -out=tfplan
+          fi
+          terraform show -no-color tfplan | grep -E "^Plan:|No changes" | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: Terraform apply
-        if: inputs.action == 'apply'
+      - name: Save plan for the deploy job
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: |
+            terraform/tfplan
+            terraform/build/
+            terraform/.terraform.lock.hcl
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: 3-deploy (apply or destroy the saved plan)
+    needs: [preflight, plan]
+    if: inputs.action == 'apply' || inputs.action == 'destroy'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: terraform
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: latest
+          terraform_wrapper: false
+
+      - name: Terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ needs.preflight.outputs.bucket }}" \
+            -backend-config="key=${STATE_KEY}" \
+            -backend-config="region=${AWS_REGION}"
+
+      - name: Terraform apply (exact saved plan)
         run: |
           terraform apply -input=false tfplan
-          terraform output
+          echo "## 3-deploy: ${{ inputs.action }} finished" >> "$GITHUB_STEP_SUMMARY"
+          terraform output -no-color | tee -a "$GITHUB_STEP_SUMMARY" || true
+
+  # ---------------------------------------------------------------------------
+  test:
+    name: 4-test (tagged vs untagged instance)
+    needs: preflight
+    if: inputs.action == 'test'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: latest
+          terraform_wrapper: false
+
+      - name: Terraform init (read outputs only)
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ needs.preflight.outputs.bucket }}" \
+            -backend-config="key=${STATE_KEY}" \
+            -backend-config="region=${AWS_REGION}"
 
       - name: End-to-end test
-        if: inputs.action == 'test'
         run: |
           set -euo pipefail
           TOPIC=$(terraform output -raw action_topic_arn)
@@ -141,7 +290,7 @@ jobs:
           aws logs tail "$LOG_GROUP" --since 10m --format short || true
 
           {
-            echo "## AWS Cost Guardian: end-to-end test"
+            echo "## 4-test: end-to-end result"
             echo ""
             echo "| Instance | Tag AutoStop=true | State after alert | Expected |"
             echo "| --- | --- | --- | --- |"
@@ -155,7 +304,3 @@ jobs:
             echo "FAIL: tagged=$STATE untagged=$UNTAGGED_STATE" | tee -a "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
-
-      - name: Terraform destroy
-        if: inputs.action == 'destroy'
-        run: terraform destroy -input=false -auto-approve
