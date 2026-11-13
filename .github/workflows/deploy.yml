@@ -1,0 +1,161 @@
+name: Cost Guardian
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "What to run"
+        required: true
+        default: plan
+        type: choice
+        options: [plan, apply, test, destroy]
+      alert_email:
+        description: "Email for budget alerts"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cost-guardian
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  TF_IN_AUTOMATION: "true"
+  TF_VAR_alert_email: ${{ inputs.alert_email }}
+  TF_VAR_aws_region: ${{ secrets.AWS_REGION }}
+
+jobs:
+  guardian:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Who am I
+        run: aws sts get-caller-identity --query "{Account:Account,Arn:Arn}" --output table
+
+      - name: State bucket (create once if missing)
+        id: state
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="cost-guardian-tfstate-${ACCOUNT_ID}-${AWS_REGION}"
+          echo "bucket=${BUCKET}" >> "$GITHUB_OUTPUT"
+          if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            echo "State bucket exists: $BUCKET"
+          else
+            echo "Creating state bucket: $BUCKET"
+            if [ "$AWS_REGION" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "$BUCKET"
+            else
+              aws s3api create-bucket --bucket "$BUCKET" \
+                --create-bucket-configuration LocationConstraint="$AWS_REGION"
+            fi
+            aws s3api put-bucket-versioning --bucket "$BUCKET" \
+              --versioning-configuration Status=Enabled
+            aws s3api put-bucket-encryption --bucket "$BUCKET" \
+              --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+            aws s3api put-public-access-block --bucket "$BUCKET" \
+              --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+          fi
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: latest
+          terraform_wrapper: false
+
+      - name: Terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ steps.state.outputs.bucket }}" \
+            -backend-config="key=aws-cost-guardian/terraform.tfstate" \
+            -backend-config="region=${AWS_REGION}"
+
+      - name: Terraform fmt and validate
+        run: |
+          terraform fmt -check -recursive || { terraform fmt -recursive -diff; echo "::warning::Terraform formatting differs (shown above)"; }
+          terraform validate
+
+      - name: Terraform plan
+        if: inputs.action == 'plan' || inputs.action == 'apply'
+        run: terraform plan -input=false -out=tfplan
+
+      - name: Terraform apply
+        if: inputs.action == 'apply'
+        run: |
+          terraform apply -input=false tfplan
+          terraform output
+
+      - name: End-to-end test
+        if: inputs.action == 'test'
+        run: |
+          set -euo pipefail
+          TOPIC=$(terraform output -raw action_topic_arn)
+          LOG_GROUP=$(terraform output -raw lambda_log_group)
+          AMI="resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
+
+          TAGGED=$(aws ec2 run-instances --image-id "$AMI" --instance-type t3.micro --count 1 \
+            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=guardian-test-tagged},{Key=AutoStop,Value=true}]' \
+            --query 'Instances[0].InstanceId' --output text)
+          UNTAGGED=$(aws ec2 run-instances --image-id "$AMI" --instance-type t3.micro --count 1 \
+            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=guardian-test-untagged}]' \
+            --query 'Instances[0].InstanceId' --output text)
+          echo "Tagged: $TAGGED | Untagged: $UNTAGGED"
+
+          cleanup() {
+            echo "Cleaning up test instances"
+            aws ec2 terminate-instances --instance-ids "$TAGGED" "$UNTAGGED" \
+              --query "TerminatingInstances[].[InstanceId,CurrentState.Name]" --output table || true
+          }
+          trap cleanup EXIT
+
+          aws ec2 wait instance-running --instance-ids "$TAGGED" "$UNTAGGED"
+          echo "Both instances running. Sending test alert..."
+
+          aws sns publish --topic-arn "$TOPIC" \
+            --subject "TEST: AWS Budget exceeded" \
+            --message "Manual end-to-end test of AWS Cost Guardian from GitHub Actions"
+
+          STATE=""
+          for i in $(seq 1 18); do
+            sleep 10
+            STATE=$(aws ec2 describe-instances --instance-ids "$TAGGED" \
+              --query 'Reservations[0].Instances[0].State.Name' --output text)
+            echo "Tagged instance state: $STATE"
+            if [ "$STATE" = "stopping" ] || [ "$STATE" = "stopped" ]; then break; fi
+          done
+          UNTAGGED_STATE=$(aws ec2 describe-instances --instance-ids "$UNTAGGED" \
+            --query 'Reservations[0].Instances[0].State.Name' --output text)
+
+          echo "----- Lambda logs -----"
+          aws logs tail "$LOG_GROUP" --since 10m --format short || true
+
+          {
+            echo "## AWS Cost Guardian: end-to-end test"
+            echo ""
+            echo "| Instance | Tag AutoStop=true | State after alert | Expected |"
+            echo "| --- | --- | --- | --- |"
+            echo "| guardian-test-tagged ($TAGGED) | yes | $STATE | stopping / stopped |"
+            echo "| guardian-test-untagged ($UNTAGGED) | no | $UNTAGGED_STATE | running |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if { [ "$STATE" = "stopping" ] || [ "$STATE" = "stopped" ]; } && [ "$UNTAGGED_STATE" = "running" ]; then
+            echo "PASS: only the tagged instance was stopped" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "FAIL: tagged=$STATE untagged=$UNTAGGED_STATE" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: Terraform destroy
+        if: inputs.action == 'destroy'
+        run: terraform destroy -input=false -auto-approve
