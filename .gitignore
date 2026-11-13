@@ -1,0 +1,18 @@
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+*.tfplan
+terraform/build/
+terraform.tfvars
+*.auto.tfvars
+
+# Never commit credentials
+.aws/
+*.pem
+.env
+
+# Python
+__pycache__/
+*.pyc
