@@ -1,0 +1,8 @@
+# Copy to terraform.tfvars (git-ignored) and edit.
+alert_email        = "you@example.com"
+# aws_profile      = "mg-lab"   # only for local runs
+aws_region         = "us-east-1"
+monthly_budget_usd = 10
+
+# Start with dry_run = true if you want to see the logs before anything is stopped.
+dry_run = false
