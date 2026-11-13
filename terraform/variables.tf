@@ -1,3 +1,9 @@
+variable "enable_budget" {
+  description = "Create the AWS Budget. Set false in sandbox accounts where an Organization SCP denies AWS Budgets."
+  type        = bool
+  default     = true
+}
+
 variable "aws_region" {
   description = "Region for SNS, Lambda and CloudWatch Logs. Must be the region your lab EC2 instances run in."
   type        = string
