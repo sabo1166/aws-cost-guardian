@@ -147,7 +147,7 @@ jobs:
       - name: Terraform init
         run: |
           terraform init -input=false \
-            -backend-config="bucket=${{ needs.preflight.outputs.bucket }}" \
+            -backend-config="bucket=cost-guardian-tfstate-$(aws sts get-caller-identity --query Account --output text)-${AWS_REGION}" \
             -backend-config="key=${STATE_KEY}" \
             -backend-config="region=${AWS_REGION}"
 
@@ -206,7 +206,7 @@ jobs:
       - name: Terraform init
         run: |
           terraform init -input=false \
-            -backend-config="bucket=${{ needs.preflight.outputs.bucket }}" \
+            -backend-config="bucket=cost-guardian-tfstate-$(aws sts get-caller-identity --query Account --output text)-${AWS_REGION}" \
             -backend-config="key=${STATE_KEY}" \
             -backend-config="region=${AWS_REGION}"
 
@@ -242,7 +242,7 @@ jobs:
       - name: Terraform init (read outputs only)
         run: |
           terraform init -input=false \
-            -backend-config="bucket=${{ needs.preflight.outputs.bucket }}" \
+            -backend-config="bucket=cost-guardian-tfstate-$(aws sts get-caller-identity --query Account --output text)-${AWS_REGION}" \
             -backend-config="key=${STATE_KEY}" \
             -backend-config="region=${AWS_REGION}"
 
