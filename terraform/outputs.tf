@@ -17,5 +17,6 @@ output "lambda_log_group" {
 }
 
 output "budget_name" {
-  value = aws_budgets_budget.monthly.name
+  description = "Null when enable_budget = false."
+  value       = one(aws_budgets_budget.monthly[*].name)
 }
