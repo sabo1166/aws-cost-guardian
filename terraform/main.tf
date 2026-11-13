@@ -84,6 +84,8 @@ resource "aws_sns_topic_subscription" "action_email" {
 # ---------------------------------------------------------------------------
 
 resource "aws_budgets_budget" "monthly" {
+  count = var.enable_budget ? 1 : 0
+
   name         = "${var.project_name}-monthly"
   budget_type  = "COST"
   limit_amount = format("%.2f", var.monthly_budget_usd)
