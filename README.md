@@ -65,14 +65,34 @@ Terraform state lives in `cost-guardian-tfstate-<account-id>-<region>` with nati
 
 ## 📌 Status
 
+Deployed and tested from GitHub Actions on 13 Nov 2026, in an AWS training sandbox account.
+
 | Check | Result |
 | --- | --- |
-| Code committed | ✅ |
-| First apply in GitHub Actions | ❌ failed: AWS rejected the access key in repository secrets (`The security token included in the request is invalid`). Fixing the secret. |
-| Deployed to AWS | ⏳ |
+| 1-preflight: credentials and service access | ✅ (AWS Budgets blocked by an Organization SCP in the sandbox) |
+| 2-plan: init, validate, plan | ✅ |
+| 3-deploy: SNS topics, Lambda, IAM role, log group | ✅ with `enable_budget = false` |
+| 4-test: tagged instance stopped by the test alert | ✅ stopping about 1 second after the alert |
+| 4-test: untagged instance left running | ✅ |
+| Test instances terminated after the test | ✅ |
+| AWS Budget created | ❌ not possible in this sandbox (SCP explicit deny on `budgets:ModifyBudget`) |
 | Email subscriptions confirmed | ⏳ |
-| Tagged instance stopped by test alert | ⏳ |
-| Untagged instance left running | ⏳ |
+
+Lambda log from the passing test:
+
+```
+Alert received | subject=TEST: AWS Budget exceeded
+Running instances tagged AutoStop=true: ['i-0751c61b1ec1835e0']
+{"action": "stopped", "instances": [{"id": "i-0751c61b1ec1835e0", "state": "stopping"}]}
+```
+
+### 🐞 Problems I hit and how I fixed them
+
+| Problem | Where it showed | Fix |
+| --- | --- | --- |
+| `The security token included in the request is invalid` | configure-aws-credentials | Replaced the access key in the repository secrets |
+| `AccessDeniedException ... explicit deny in a service control policy` on `budgets:ModifyBudget` | terraform apply | Made the Budget optional with `enable_budget` |
+| `Skip output 'bucket' since it may contain secret`, then `Invalid Value` on init | 2-plan | Each job derives the state bucket name itself instead of passing it between jobs |
 
 ## 💲 Cost
 
